@@ -11,6 +11,10 @@
 (*                                                                            *)
 (******************************************************************************)
 
+let max (a : int) b = if a > b then a else b 
+let min (a : int) b = if a < b then a else b 
+
+
 (** A point is a pair of a line number and a column number. *)
 type point =
   int * int
@@ -185,6 +189,12 @@ type state = {
     (** The ribbon width. This parameter is fixed throughout the execution of
         the renderer. *)
 
+    mutable hardlines : int;
+    (** How many hardlines we already output at this point *)
+    
+    mutable softlines : int;
+    (** How many softlines we need to output at this point *)
+
     mutable last_indent: int;
     (** The number of blanks that were printed at the beginning of the current
         line. This field is updated (only) when a hardline is emitted. It is
@@ -209,6 +219,9 @@ type state = {
 let initial rfrac width = {
   width = width;
   ribbon = max 0 (min width (truncate (float_of_int width *. rfrac)));
+  (* We think there is a logical newline before firstline *)
+  hardlines = 1;
+  softlines = 0;
   last_indent = 0;
   line = 0;
   column = 0
@@ -239,9 +252,6 @@ class type custom = object
       output channel. *)
   method pretty: output -> state -> int -> bool -> unit
 
-  (** The method [compact] is used by the compact rendering algorithm. It has
-      access to the output channel only. *)
-  method compact: output -> unit
 
 end
 
@@ -297,6 +307,8 @@ type document =
      directly within the right branch of an [IfFlat] construct. *)
 
   | HardLine
+
+  | SoftLines of int
 
   (* The following constructors store their space requirement. This is the
      document's apparent length, if printed in flattening mode. This
@@ -374,7 +386,7 @@ let rec requirement = function
          in the left-hand side of [IfFlat], so this recursive call is not a
          problem; the function [requirement] has constant time complexity. *)
       requirement doc1
-  | HardLine ->
+  | HardLine | SoftLines _ ->
       (* A hard line cannot be printed in flattening mode. *)
       infinity
   | Cat (req, _, _)
@@ -442,6 +454,8 @@ let utf8format f =
 
 let hardline =
   HardLine
+
+let softlines n = SoftLines n
 
 let blank n =
   match n with
@@ -551,18 +565,31 @@ let rec pretty
   (doc : document)
   (cont : cont)
 : unit =
+  let pre_output_non_newlines () =
+    if state.softlines > state.hardlines then (
+      for _i = 0 to state.softlines - state.hardlines - 1 do
+        output#char '\n'
+      done;
+      state.hardlines <- state.softlines);
+    if state.hardlines > 0 then blanks output state.last_indent;
+    state.softlines <- 0;
+    state.hardlines <- 0
+  in
+
   match doc with
 
   | Empty ->
       continue output state cont
 
   | Char c ->
+      pre_output_non_newlines ();
       output#char c;
       state.column <- state.column + 1;
       (* assert (ok state flatten); *)
       continue output state cont
 
   | String s ->
+      pre_output_non_newlines ();
       let len = String.length s in
       output#substring s 0 len;
       state.column <- state.column + len;
@@ -570,12 +597,14 @@ let rec pretty
       continue output state cont
 
   | FancyString (s, ofs, len, apparent_length) ->
+      pre_output_non_newlines ();
       output#substring s ofs len;
       state.column <- state.column + apparent_length;
       (* assert (ok state flatten); *)
       continue output state cont
 
   | Blank n ->
+      pre_output_non_newlines ();
       blanks output n;
       state.column <- state.column + n;
       (* assert (ok state flatten); *)
@@ -588,13 +617,21 @@ let rec pretty
       assert (not flatten);
       (* Emit a hardline. *)
       output#char '\n';
-      blanks output indent;
-      state.line <- state.line + 1;
-      state.column <- indent;
+      state.hardlines <- state.hardlines + 1;
+      if state.hardlines > state.softlines then state.line <- state.line + 1;
       state.last_indent <- indent;
+      state.column <- indent;
       (* Continue. *)
       continue output state cont
 
+  | SoftLines n ->
+      assert (not flatten);
+      state.softlines <- Int.max state.softlines n;
+      state.line <- state.line + (state.softlines - state.hardlines);
+      state.last_indent <- indent;
+      state.column <- indent;
+      continue output state cont
+    
   | IfFlat (doc1, doc2) ->
       (* Pick an appropriate sub-document, based on the current flattening
          mode. *)
@@ -660,52 +697,15 @@ and continue output state = function
 let pretty output state indent flatten doc =
   pretty output state indent flatten doc KNil
 
-(* ------------------------------------------------------------------------- *)
-
-(* The compact rendering algorithm. *)
-
-let rec compact output doc cont =
-  match doc with
-  | Empty ->
-      continue output cont
-  | Char c ->
-      output#char c;
-      continue output cont
-  | String s ->
-      let len = String.length s in
-      output#substring s 0 len;
-      continue output cont
-  | FancyString (s, ofs, len, _apparent_length) ->
-      output#substring s ofs len;
-      continue output cont
-  | Blank n ->
-      blanks output n;
-      continue output cont
-  | HardLine ->
-      output#char '\n';
-      continue output cont
-  | Cat (_, doc1, doc2) ->
-      compact output doc1 (doc2 :: cont)
-  | IfFlat (doc, _)
-  | Nest (_, _, doc)
-  | Group (_, doc)
-  | Align (_, doc)
-  | Range (_, _, doc) ->
-      compact output doc cont
-  | Custom c ->
-      (* Invoke the document's custom rendering function. *)
-      c#compact output;
-      continue output cont
-
-and continue output cont =
-  match cont with
-  | [] ->
-      ()
-  | doc :: cont ->
-      compact output doc cont
-
-let compact output doc =
-  compact output doc []
+let rec refresh document =
+  match document with
+  | IfFlat (x, y) -> ifflat (refresh x) (refresh y)
+  | Cat (_, x, y) -> refresh x ^^ refresh y
+  | Nest (_, i, x) -> nest i (refresh x)
+  | Group (_, x) -> group (refresh x)
+  | Align (_, x) -> align x
+  | Range (_, hook, x) -> range hook (refresh x)
+  | doc -> doc
 
 (* ------------------------------------------------------------------------- *)
 
@@ -717,7 +717,6 @@ module type RENDERER = sig
   type channel
   type document
   val pretty: float -> int -> channel -> document -> unit
-  val compact: channel -> document -> unit
 end
 
 module MakeRenderer (X : sig
@@ -729,7 +728,6 @@ end)
   type channel = X.channel
   type nonrec document = document
   let pretty rfrac width channel doc = pretty (X.output channel) (initial rfrac width) 0 false doc
-  let compact channel doc = compact (X.output channel) doc
 end
 
 module ToChannel =
@@ -749,3 +747,13 @@ module ToFormatter =
     type channel = Format.formatter
     let output fmt = new buffering (new formatter_output fmt)
   end)
+
+module ToNull = MakeRenderer (struct
+  type channel = unit
+
+  let output () =
+    object
+      method char _ = ()
+      method substring _ _ _ = ()
+    end
+end)

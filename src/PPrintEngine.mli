@@ -75,6 +75,10 @@ val utf8format: ('a, unit, string, document) format4 -> 'a
    combinator should be seldom used; consider using {!break} instead. *)
 val hardline: document
 
+(**Softlines [n] give you guarantee that at least [n] hardlines will be 
+   inserted to the insertion point.*)
+val softlines : int -> document
+
 (**The atomic document [blank n] consists of [n] blank characters. A blank
    character is like an ordinary ASCII space character [char ' '], except
    that blank characters that appear at the end of a line are automatically
@@ -165,10 +169,6 @@ module type RENDERER = sig
       maximum number of non-indentation characters per line. *)
   val pretty: float -> int -> channel -> document -> unit
 
-  (** [compact channel document] prints the document [document] to the output
-      channel [channel]. No indentation is used. All newline instructions are
-      respected, that is, no groups are flattened. *)
-  val compact: channel -> document -> unit
 
 end
 
@@ -186,6 +186,9 @@ module ToBuffer : RENDERER
 module ToFormatter : RENDERER
   with type channel = Format.formatter
    and type document = document
+
+(**This renderer do not output. *)
+module ToNull : RENDERER with type channel = unit and type document = document
 
 (** {1:defining Defining Custom Documents} *)
 
@@ -231,6 +234,12 @@ type state = {
     (** The ribbon width. This parameter is fixed throughout the execution of
         the renderer. *)
 
+    mutable hardlines : int;
+    (** How many hardlines we already output at this point *)
+    
+    mutable softlines : int;
+    (** How many softlines we need to output at this point *)
+
     mutable last_indent: int;
     (** The number of blanks that were printed at the beginning of the current
         line. This field is updated (only) when a hardline is emitted. It is
@@ -271,9 +280,6 @@ class type custom = object
      is consistent with what is sent to the output channel. *)
   method pretty: output -> state -> int -> bool -> unit
 
-  (**The method [compact] is used by the compact rendering algorithm. It
-     has access to the output channel only. *)
-  method compact: output -> unit
 
 end
 
@@ -302,6 +308,7 @@ val requirement: document -> requirement
    {!class-type-custom}. *)
 val pretty: output -> state -> int -> bool -> document -> unit
 
-(**[compact output doc] prints the document [doc]. See the documentation of
-   the method [compact] in the class {!class-type-custom}. *)
-val compact: output -> document -> unit
+
+(**Rebuild document bottom to up, to make new requirement value of custom
+   effective*)
+val refresh : document -> document
